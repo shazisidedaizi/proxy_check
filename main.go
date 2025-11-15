@@ -210,7 +210,7 @@ func main() {
 
 		results = append(results, NodeResult{
 			Line:    line,
-			Country: resp.Country,
+			Country: resp.Location.CountryCode,
 			Delay:   resp.Delay,
 		})
 	}
