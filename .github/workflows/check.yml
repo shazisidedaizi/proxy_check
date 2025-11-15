@@ -1,4 +1,4 @@
-name: Check Proxies
+name: Proxy Checker
 
 on:
   workflow_dispatch:
@@ -8,22 +8,19 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Go
+      - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: '1.24'
+          cache: true
 
-      - name: Build without go.mod
-        env:
-          GO111MODULE: off
+      - name: Build binary
         run: |
-          mkdir -p ~/go/src/checker
-          cp -r * ~/go/src/checker/
-          cd ~/go/src/checker
-          go build -o checker main.go
+          go mod tidy
+          go build -o checker .
 
       - name: Run checker
         env:
@@ -32,4 +29,4 @@ jobs:
           API_TOKEN: ${{ secrets.API_TOKEN }}
           NODES_URL: ${{ secrets.NODES_URL }}
         run: |
-          ~/go/src/checker/checker
+          ./checker
