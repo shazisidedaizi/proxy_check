@@ -6,7 +6,6 @@ on:
 jobs:
   run-checker:
     runs-on: ubuntu-latest
-
     steps:
       # 拉取仓库代码
       - name: Checkout repository
@@ -19,21 +18,24 @@ jobs:
           go-version: '1.24'
           cache: true
 
-      # 查看 Go 版本（可选，便于调试）
+      # 查看 Go 版本（可选）
       - name: Show Go version
         run: go version
 
-      # 下载依赖并构建二进制
+      # 构建二进制
       - name: Build binary
         run: |
           go mod tidy
           go build -o checker .
 
-      # 运行程序
+      # 运行程序（强制展开日志）
       - name: Run checker
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           API_TOKEN: ${{ secrets.API_TOKEN }}
           NODES_URL: ${{ secrets.NODES_URL }}
-        run: ./checker
+        run: |
+          echo "::group::Proxy Checker Output"
+          ./checker
+          echo "::endgroup::"
