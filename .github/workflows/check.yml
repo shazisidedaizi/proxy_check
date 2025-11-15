@@ -1,0 +1,29 @@
+name: Check Proxies
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-checker:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.22'
+
+      - name: Build
+        run: go build -o checker main.go
+
+      - name: Run checker
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          API_TOKEN: ${{ secrets.API_TOKEN }}
+          NODES_URL: ${{ secrets.NODES_URL }}
+        run: |
+          ./checker
