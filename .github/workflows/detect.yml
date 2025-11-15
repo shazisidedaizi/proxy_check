@@ -1,0 +1,32 @@
+name: Proxy Check
+
+on:
+  workflow_dispatch:  # 手动触发
+  #schedule:
+  #  - cron: '0 0 * * *'  # 每天 0 点自动运行
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Install dependencies
+        run: go mod tidy || true
+
+      - name: Run Proxy Checker
+        env:
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+        run: go run check_proxy.go
+
+      - name: Upload result
+        uses: actions/upload-artifact@v3
+        with:
+          name: proxy_valid
+          path: proxy_valid.txt
