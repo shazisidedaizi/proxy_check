@@ -232,6 +232,9 @@ func main() {
 
     			for attempt := 0; attempt < 4; attempt++ {  // 最多试 4 次
         			isHoney, reason := checkSocks5Honeypot(addr)
+					
+					fmt.Printf("[尝试 %d/%d] %s -> %s (isHoney=%v)\n", 
+        				attempt+1, 4, node, reason, isHoney)
 
         			// 1. 连接类错误 → 直接重试，不计入任何判断
         			if strings.Contains(reason, "无法连接") ||
