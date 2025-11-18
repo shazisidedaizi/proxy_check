@@ -1,16 +1,18 @@
 package main
 
 import (
-	"bufio"
-	"encoding/json"
-	"fmt"
-	"io"
-	"net/http"
-	"net/url"
-	"os"
-	"sort"
-	"strings"
-	"time"
+    "bufio"
+    "encoding/json"
+    "encoding/binary"
+    "fmt"
+    "io"
+    "net"
+    "net/http"
+    "net/url"
+    "os"
+    "sort"
+    "strings"
+    "time"
 )
 
 // ====================== API 结果结构 ======================
@@ -114,6 +116,58 @@ func checkProxy(proxyStr, apiToken string) (CheckResp, error) {
 	return result, err
 }
 
+// ====================== SOCKS5 蜜罐检测 ======================
+func checkSocks5Honeypot(proxyAddr string) (isHoneypot bool, reason string) {
+	start := time.Now()
+
+	conn, err := net.DialTimeout("tcp", proxyAddr, 3*time.Second)
+	if err != nil {
+		return false, "无法连接节点"
+	}
+	defer conn.Close()
+
+	// 发起 SOCKS5 hello
+	conn.Write([]byte{0x05, 0x01, 0x00})
+
+	buf := make([]byte, 2)
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, err = conn.Read(buf)
+	if err != nil {
+		return false, "未返回握手响应"
+	}
+
+	if buf[0] == 0x05 && buf[1] == 0x00 {
+		// 发起假请求
+		req := []byte{
+			0x05, 0x01, 0x00, 0x01,
+			240, 0, 0, 1,
+			0xFF, 0xFF,
+		}
+		conn.Write(req)
+
+		resp := make([]byte, 10)
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, _ := conn.Read(resp)
+
+		elapsed := time.Since(start).Milliseconds()
+
+		if elapsed < 20 {
+			return true, "响应过快(<20ms)，可能为蜜罐"
+		}
+		if n >= 2 && resp[1] == 0x00 {
+			return true, "固定返回成功 REP=00"
+		}
+		if n >= 10 {
+			bndPort := binary.BigEndian.Uint16(resp[8:10])
+			if bndPort == 0 {
+				return true, "返回 BND.PORT=0，不真实"
+			}
+		}
+	}
+
+	return false, "非标准 SOCKS5 或行为正常"
+}
+
 // ========================= 主程序 =========================
 func main() {
 	botToken := os.Getenv("BOT_TOKEN")
@@ -187,6 +241,12 @@ func main() {
 	var results []NodeResult
 
 	for _, node := range nodes {
+		// ==================== 新增：蜜罐检测 ====================
+		isHoney, honeyReason := checkSocks5Honeypot(strings.TrimPrefix(node, "socks5://"))
+		if isHoney {
+			fmt.Printf("[蜜罐] %s -> %s\n", node, honeyReason)
+			continue // 发现蜜罐，跳过原有 API 检测
+		}
 		resp, err := checkProxy(node, apiToken)
 		if err != nil || !resp.Success {
 			fmt.Printf("节点无效或请求失败: %s\n", node)
