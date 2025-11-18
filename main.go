@@ -2,31 +2,34 @@ package main
 
 import (
 	"bufio"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
 // ====================== API 结果结构 ======================
 type CheckResp struct {
-    Success bool   `json:"success"`
-    Proxy   string `json:"proxy"`
-    Delay   float64 `json:"elapsed_ms"`
-    Company struct {
-        Type string `json:"type"`
-    } `json:"company"`
-    ASN struct {
-        Type string `json:"type"`
-    } `json:"asn"`
-    Location struct {
-        CountryCode string `json:"country_code"`
-    } `json:"location"`
+	Success bool    `json:"success"`
+	Proxy   string  `json:"proxy"`
+	Delay   float64 `json:"elapsed_ms"`
+	Company struct {
+		Type string `json:"type"`
+	} `json:"company"`
+	ASN struct {
+		Type string `json:"type"`
+	} `json:"asn"`
+	Location struct {
+		CountryCode string `json:"country_code"`
+	} `json:"location"`
 }
 
 // ====================== TG 发送函数 ======================
@@ -69,15 +72,14 @@ func fetchNodesFromURL(rawURL string) ([]string, error) {
 	return nodes, nil
 }
 
-// ====================== 调用 API 检测，带重试 + 完整调试 ======================
+// ====================== 调用 API 检测 ======================
 func checkProxy(proxyStr, apiToken string) (CheckResp, error) {
 	api := fmt.Sprintf(
 		"https://check.xn--xg8h.netlib.re/check?proxy=%s&token=%s",
 		url.QueryEscape(proxyStr), apiToken,
 	)
-	fmt.Printf("检测节点 → %s\n", api)
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := &http.Client{Timeout: 25 * time.Second}
 	var result CheckResp
 	var err error
 	maxRetries := 3
@@ -87,31 +89,73 @@ func checkProxy(proxyStr, apiToken string) (CheckResp, error) {
 		resp, e := client.Get(api)
 		if e != nil {
 			err = e
-			fmt.Printf("请求失败 (%d/%d): %v | 节点: %s\n", attempt, maxRetries, e, proxyStr)
-		} else {
-			defer resp.Body.Close()
-			bodyBytes, _ := io.ReadAll(resp.Body)
-			fmt.Printf("API 原始返回 (%d/%d):\n%s\n", attempt, maxRetries, string(bodyBytes))
-
-			err = json.Unmarshal(bodyBytes, &result)
-			if err != nil {
-				fmt.Printf("JSON 解析失败 (%d/%d): %v\n", attempt, maxRetries, err)
-				continue
-			}
-			if result.Success {
-				break
-			} else {
-				fmt.Printf("节点无效 (%d/%d): %s\n", attempt, maxRetries, proxyStr)
-			}
+			continue
 		}
 
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		err = json.Unmarshal(bodyBytes, &result)
+		if err != nil {
+			continue
+		}
+		if result.Success {
+			break
+		}
 		if attempt < maxRetries {
-			wait := baseDelay * (1 << (attempt - 1))
-			fmt.Printf("等待 %v 后重试...\n", wait)
-			time.Sleep(wait)
+			time.Sleep(baseDelay * (1 << (attempt - 1)))
 		}
 	}
 	return result, err
+}
+
+// ====================== SOCKS5 蜜罐检测 ======================
+func checkSocks5Honeypot(proxyAddr string) (bool, string) {
+	start := time.Now()
+
+	conn, err := net.DialTimeout("tcp", proxyAddr, 3*time.Second)
+	if err != nil {
+		return false, "无法连接节点"
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		return false, "握手发送失败"
+	}
+
+	buf := make([]byte, 2)
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, err = conn.Read(buf)
+	if err != nil {
+		return false, "未返回握手响应"
+	}
+
+	if buf[0] == 0x05 && buf[1] == 0x00 {
+		req := []byte{0x05, 0x01, 0x00, 0x01, 240, 0, 0, 1, 0xFF, 0xFF}
+		if _, err := conn.Write(req); err != nil {
+			return false, "发送假请求失败"
+		}
+
+		resp := make([]byte, 10)
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, _ := conn.Read(resp)
+
+		elapsed := time.Since(start).Milliseconds()
+		if elapsed < 20 {
+			return true, "响应过快(<20ms)，可能为蜜罐"
+		}
+		if n >= 2 && resp[1] == 0x00 {
+			return true, "固定返回成功 REP=00"
+		}
+		if n >= 10 {
+			bndPort := binary.BigEndian.Uint16(resp[8:10])
+			if bndPort == 0 {
+				return true, "返回 BND.PORT=0，不真实"
+			}
+		}
+	}
+
+	return false, "非标准 SOCKS5 或行为正常"
 }
 
 // ========================= 主程序 =========================
@@ -126,58 +170,34 @@ func main() {
 		os.Exit(1)
 	}
 
-	// ====================== 1. 下载 + 自动提取 + 去重 ======================
 	nodes, err := fetchNodesFromURL(nodesURL)
-	if err != nil {
-		fmt.Println("下载节点列表失败:", err)
+	if err != nil || len(nodes) == 0 {
+		fmt.Println("下载节点列表失败或为空:", err)
 		os.Exit(1)
 	}
 
 	var cleanNodes []string
 	seen := make(map[string]bool)
-
 	for _, raw := range nodes {
 		raw = strings.TrimSpace(raw)
 		if raw == "" {
 			continue
 		}
-
 		var proxy string
 		if strings.Contains(raw, "#") {
-			parts := strings.Split(raw, "#")
-			proxy = parts[0]
-			fmt.Printf("提取代理 ← %s (原: %s)\n", proxy, raw)
-		} else if strings.HasPrefix(raw, "socks5://") || strings.HasPrefix(raw, "http://") {
-			proxy = raw
-			fmt.Printf("标准代理 ← %s\n", proxy)
+			proxy = strings.Split(raw, "#")[0]
 		} else {
-			fmt.Printf("跳过非法: %s\n", raw)
-			continue
+			proxy = raw
 		}
-
 		if !seen[proxy] {
 			seen[proxy] = true
 			cleanNodes = append(cleanNodes, proxy)
-		} else {
-			fmt.Printf("重复跳过: %s\n", proxy)
 		}
 	}
-
 	nodes = cleanNodes
-	fmt.Printf("处理完成：共提取 %d 个唯一代理节点\n", len(nodes))
+	fmt.Printf("处理完成：共 %d 个唯一节点\n", len(nodes))
 
-	if len(nodes) == 0 {
-		sendTelegramMessage(botToken, chatId, "本次扫描无有效代理节点")
-		return
-	}
-
-	// 打印前3个
-	fmt.Println("前 3 条有效节点:")
-	for i := 0; i < 3 && i < len(nodes); i++ {
-		fmt.Printf("  [%d] %s\n", i+1, nodes[i])
-	}
-
-	// ====================== 2. 检测节点 ======================
+	// ===================== 并发检测 =====================
 	type NodeResult struct {
 		Line    string
 		Country string
@@ -185,37 +205,104 @@ func main() {
 	}
 
 	var results []NodeResult
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	concurrency := 20
+	sem := make(chan struct{}, concurrency)
 
 	for _, node := range nodes {
-		resp, err := checkProxy(node, apiToken)
-		if err != nil || !resp.Success {
-			fmt.Printf("节点无效或请求失败: %s\n", node)
-			continue
-		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(node string) {
+			defer wg.Done()
+			defer func() { <-sem }()
 
-		// ISP 判断
-		if resp.Company.Type != "isp" && resp.ASN.Type != "isp" {
-			fmt.Printf("不是 ISP，跳过: %s\n", node)
-			continue
-		}
+			addr := node
+			if strings.HasPrefix(node, "socks5://") {
+				addr = strings.TrimPrefix(node, "socks5://")
+			} else if strings.HasPrefix(node, "http://") {
+				// HTTP 不检测蜜罐
+				addr = ""
+			}
 
-		// 延迟过滤（< 1000ms）
-		if resp.Delay > 1000 {
-			fmt.Printf("延迟过高 %.0fms，跳过: %s\n", resp.Delay, node)
-			continue
-		}
+			if addr != "" {
+    			var isDefinitelyHoney bool = false
+    			var honeyReason string
+   	 			var successCount int = 0  // 成功建立 SOCKS5 连接的次数
 
-		line := fmt.Sprintf("%s#%s", resp.Proxy, resp.Location.CountryCode)
-		fmt.Printf("有效节点: %s (延迟: %.0fms)\n", line, resp.Delay)
+    			for attempt := 0; attempt < 4; attempt++ {  // 最多试 4 次
+        			isHoney, reason := checkSocks5Honeypot(addr)
 
-		results = append(results, NodeResult{
-			Line:    line,
-			Country: resp.Location.CountryCode,
-			Delay:   resp.Delay,
-		})
+        			// 1. 连接类错误 → 直接重试，不计入任何判断
+        			if strings.Contains(reason, "无法连接") ||
+           				strings.Contains(reason, "握手发送失败") ||
+           				strings.Contains(reason, "未返回握手响应") ||
+           				strings.Contains(reason, "ReadDeadline") {
+            			if attempt < 3 {
+                			time.Sleep(time.Duration(2<<attempt) * time.Second) // 2s → 4s → 8s
+            			}
+            			continue
+        			}
+
+        			// 2. 只要有一次明确检测到蜜罐特征 → 立刻判定为蜜罐，彻底枪毙
+        			if isHoney {
+            			isDefinitelyHoney = true
+            			honeyReason = reason
+            			break
+        			}
+
+        			// 3. 这次是正常行为
+        			successCount++
+			        // 不需要连续，只要总成功次数 >=2 次就认为稳定（足够宽容）
+        			if successCount >= 2 {
+            			break
+        			}
+
+        			time.Sleep(1 * time.Second)
+    			}
+
+    			// 最终判断
+    			if isDefinitelyHoney {
+        			fmt.Printf("[蜜罐] %s -> %s\n", node, honeyReason)
+        			return
+    			}
+
+    			if successCount == 0 {
+        		// 4 次都彻底连不上或超时 → 放弃（不是蜜罐，但也没用）
+        			fmt.Printf("[失效] %s -> 多次尝试均无法连接，放弃\n", node)
+        			return
+    			}
+
+    			// successCount >= 1 并且没有触发蜜罐 → 放行（最宽容但最安全）
+			}
+
+			resp, err := checkProxy(node, apiToken)
+			if err != nil || !resp.Success {
+				fmt.Printf("节点无效或请求失败: %s\n", node)
+				return
+			}
+			if resp.Company.Type != "isp" && resp.ASN.Type != "isp" {
+				return
+			}
+			if resp.Delay <= 0 || resp.Delay > 1000 {
+				return
+			}
+
+			line := fmt.Sprintf("%s#%s", resp.Proxy, resp.Location.CountryCode)
+			fmt.Printf("[有效] %s (延迟: %.0fms)\n", line, resp.Delay)
+
+			mu.Lock()
+			results = append(results, NodeResult{
+				Line:    line,
+				Country: resp.Location.CountryCode,
+				Delay:   resp.Delay,
+			})
+			mu.Unlock()
+		}(node)
 	}
+	wg.Wait()
 
-	// ====================== 3. 按国家排序 ======================
+	// ====================== 排序 ======================
 	sort.Slice(results, func(i, j int) bool {
 		if results[i].Country == results[j].Country {
 			return results[i].Delay < results[j].Delay
@@ -228,14 +315,21 @@ func main() {
 		good = append(good, r.Line)
 	}
 
-	// ====================== 4. 统计 + 发送 ======================
-	fmt.Printf("扫描完成：共 %d 个节点，%d 个有效（延迟<1000ms，ISP）\n", len(nodes), len(good))
-
+	// ====================== Telegram 分批发送 ======================
 	if len(good) == 0 {
 		sendTelegramMessage(botToken, chatId, "本次扫描无有效代理节点")
 		return
 	}
 
-	text := "可用代理列表（按国家排序）：\n" + strings.Join(good, "\n")
-	sendTelegramMessage(botToken, chatId, text)
+	batchSize := 50
+	for i := 0; i < len(good); i += batchSize {
+		end := i + batchSize
+		if end > len(good) {
+			end = len(good)
+		}
+		text := fmt.Sprintf("可用代理列表（按国家排序 %d-%d）：\n%s", i+1, end, strings.Join(good[i:end], "\n"))
+		sendTelegramMessage(botToken, chatId, text)
+	}
+
+	fmt.Printf("扫描完成：共 %d 个节点，%d 个有效\n", len(nodes), len(good))
 }
