@@ -226,48 +226,54 @@ func main() {
 			}
 
 			if addr != "" {
-    			var finalIsHoney bool = false
-    			var finalReason string = "行为正常"
-    			var stableCount int = 0  // 连续几次稳定结果相同
+    			var isDefinitelyHoney bool = false
+    			var honeyReason string
+   	 			var successCount int = 0  // 成功建立 SOCKS5 连接的次数
 
-    			for attempt := 0; attempt < 5; attempt++ {  // 建议 5 次
+    			for attempt := 0; attempt < 4; attempt++ {  // 最多试 4 次
         			isHoney, reason := checkSocks5Honeypot(addr)
 
-        			// 如果是连接类错误，直接重试，不计数
-        			if strings.Contains(reason, "无法连接") || 
-           			   strings.Contains(reason, "握手发送失败") || 
-           			   strings.Contains(reason, "未返回握手响应") {
-            			time.Sleep(time.Duration(2<<attempt) * time.Second)
+        			// 1. 连接类错误 → 直接重试，不计入任何判断
+        			if strings.Contains(reason, "无法连接") ||
+           				strings.Contains(reason, "握手发送失败") ||
+           				strings.Contains(reason, "未返回握手响应") ||
+           				strings.Contains(reason, "ReadDeadline") {
+            			if attempt < 3 {
+                			time.Sleep(time.Duration(2<<attempt) * time.Second) // 2s → 4s → 8s
+            			}
             			continue
         			}
 
-        			// 只要有一次明确检测到蜜罐特征，立即判定为蜜罐（最严格）
+        			// 2. 只要有一次明确检测到蜜罐特征 → 立刻判定为蜜罐，彻底枪毙
         			if isHoney {
-            			finalIsHoney = true
-            			finalReason = reason
-            			break  // 发现蜜罐就立刻停止，不给它翻盘机会
+            			isDefinitelyHoney = true
+            			honeyReason = reason
+            			break
         			}
 
-        			// 只有连续多次都是“正常”才相信它是好的
-        			if reason == "非标准 SOCKS5 或行为正常" {
-            			stableCount++
-            			if stableCount >= 3 {  // 连续 3 次正常才放行
-                			break
-            			}
+        			// 3. 这次是正常行为
+        			successCount++
+			        // 不需要连续，只要总成功次数 >=2 次就认为稳定（足够宽容）
+        			if successCount >= 2 {
+            			break
         			}
 
         			time.Sleep(1 * time.Second)
     			}
 
-    			if finalIsHoney {
-        			fmt.Printf("[蜜罐] %s -> %s\n", node, finalReason)
+    			// 最终判断
+    			if isDefinitelyHoney {
+        			fmt.Printf("[蜜罐] %s -> %s\n", node, honeyReason)
         			return
     			}
 
-    			if stableCount < 3 {
-        			fmt.Printf("[不稳定] %s -> 检测不一致或连接不稳，放弃\n", node)
+    			if successCount == 0 {
+        		// 4 次都彻底连不上或超时 → 放弃（不是蜜罐，但也没用）
+        			fmt.Printf("[失效] %s -> 多次尝试均无法连接，放弃\n", node)
         			return
     			}
+
+    			// successCount >= 1 并且没有触发蜜罐 → 放行（最宽容但最安全）
 			}
 
 			resp, err := checkProxy(node, apiToken)
