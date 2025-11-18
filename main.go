@@ -226,6 +226,7 @@ func main() {
 			}
 
 			if addr != "" {
+				fmt.Println(">>> 准备对以下节点进行蜜罐检测:", node)
 				isHoney, honeyReason := checkSocks5Honeypot(addr)
 				if isHoney {
 					fmt.Printf("[蜜罐] %s -> %s\n", node, honeyReason)
