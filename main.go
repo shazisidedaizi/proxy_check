@@ -109,54 +109,124 @@ func checkProxy(proxyStr, apiToken string) (CheckResp, error) {
 	return result, err
 }
 
-// ====================== SOCKS5 蜜罐检测 ======================
-func checkSocks5Honeypot(proxyAddr string) (bool, string) {
-	start := time.Now()
+func normalizeSocks5Addr(node string) string {
+    node = strings.TrimSpace(node)
 
-	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
-	if err != nil {
-		return false, "无法连接节点"
-	}
-	defer conn.Close()
+    if strings.HasPrefix(node, "socks5://") {
+        node = strings.TrimPrefix(node, "socks5://")
+    }
+    if strings.HasPrefix(node, "socks://") {
+        node = strings.TrimPrefix(node, "socks://")
+    }
 
-	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
-		return false, "握手发送失败"
-	}
+    // 去掉 user:pass@
+    if strings.Contains(node, "@") {
+        parts := strings.Split(node, "@")
+        return parts[len(parts)-1] // 最后部分是 host:port
+    }
 
-	buf := make([]byte, 2)
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	_, err = conn.Read(buf)
-	if err != nil {
-		return false, "未返回握手响应"
-	}
-
-	if buf[0] == 0x05 && buf[1] == 0x00 {
-		req := []byte{0x05, 0x01, 0x00, 0x01, 240, 0, 0, 1, 0xFF, 0xFF}
-		if _, err := conn.Write(req); err != nil {
-			return false, "发送假请求失败"
-		}
-
-		resp := make([]byte, 10)
-		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-		n, _ := conn.Read(resp)
-
-		elapsed := time.Since(start).Milliseconds()
-		if elapsed < 20 {
-			return true, "响应过快(<20ms)，可能为蜜罐"
-		}
-		if n >= 2 && resp[1] == 0x00 {
-			return true, "固定返回成功 REP=00"
-		}
-		if n >= 10 {
-			bndPort := binary.BigEndian.Uint16(resp[8:10])
-			if bndPort == 0 {
-				return true, "返回 BND.PORT=0，不真实"
-			}
-		}
-	}
-
-	return false, "非标准 SOCKS5 或行为正常"
+    return node // 已经是 host:port
 }
+
+// ====================== 是否为 SOCKS5 蜜罐检测 ======================
+func checkSocks5Honeypot(rawNode string) (bool, string) {
+    // 节点解析成 ip:port
+    addr := normalizeSocks5Addr(rawNode)
+    if addr == "" {
+        return false, "非 SOCKS5"
+    }
+
+    // 连接 TCP
+    conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+    if err != nil {
+        return false, "无法连接节点"
+    }
+    defer conn.Close()
+
+    start := time.Now()
+
+    // ===================== 发送初次握手 =====================
+    // VER=5, NMETHODS=1, METHODS=NO_AUTH (0x00)
+    _, err = conn.Write([]byte{0x05, 0x01, 0x00})
+    if err != nil {
+        return false, "握手发送失败"
+    }
+
+    // 读取 METHOD 选择
+    conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+    method := make([]byte, 2)
+    _, err = conn.Read(method)
+    if err != nil {
+        return false, "未返回握手响应"
+    }
+
+    // 正常 SOCKS5 节点：method[0]=5
+    if method[0] != 0x05 {
+        return true, "VER 不是 0x05, 像蜜罐"
+    }
+
+    // ================== 如果需要认证（METHOD=2） ==================
+    if method[1] == 0x02 {
+        // 真实 SOCKS5 节点常见情况，蜜罐通常不会实现 AUTH
+        return false, "需要认证的正常 SOCKS5"
+    }
+
+    // 如果不是 NO_AUTH (0x00)，并且不是 AUTH，直接跳过
+    if method[1] != 0x00 {
+        return false, "不支持的认证类型（但不是蜜罐）"
+    }
+
+    // ============= 发送 CONNECT 请求，访问不存在的 IP/端口 =============
+    // VER=5, CMD=1, RSV=0, ATYP=1 (IPv4)
+    // DST.ADDR=240.0.0.1（不存在的 TEST 地址）
+    // DST.PORT=65535（无效端口）
+    req := []byte{
+        0x05, 0x01, 0x00, 0x01,
+        240, 0, 0, 1,
+        0xFF, 0xFF,
+    }
+
+    _, err = conn.Write(req)
+    if err != nil {
+        return false, "发送假请求失败"
+    }
+
+    // 读取回应（一般 10 字节：VER REP RSV ATYP BND.ADDR BND.PORT）
+    resp := make([]byte, 10)
+    conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+    n, _ := conn.Read(resp)
+
+    elapsed := time.Since(start).Milliseconds()
+
+    // ================== 蜜罐判断逻辑 ==================
+
+    // **** 判定 1：响应过快 ****
+    if elapsed <= 20 {
+        return true, "响应过快(<20ms)，蜜罐特征"
+    }
+
+    // **** 判定 2：固定返回成功 REP=00（但地址不存在）****
+    if n >= 2 && resp[1] == 0x00 {
+        return true, "固定返回 REP=00，蜜罐"
+    }
+
+    // **** 判定 3：BND.PORT=0（蜜罐常见特征）****
+    if n >= 10 {
+        port := binary.BigEndian.Uint16(resp[8:10])
+        if port == 0 {
+            return true, "返回 BND.PORT=0，不真实，蜜罐"
+        }
+    }
+
+    // **** 判定 4：空返回或奇怪包结构 ****
+    if n == 0 {
+        return true, "空响应，蜜罐概率高"
+    }
+
+    // 非蜜罐
+    return false, "正常 SOCKS5"
+}
+
 
 // ========================= 主程序 =========================
 func main() {
