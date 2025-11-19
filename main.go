@@ -224,7 +224,7 @@ func main() {
 		sem <- struct{}{}
 		go func(node string) {
 			defer wg.Done()
-			defer func() { <-Concurrent }()
+			defer func() { <-sem }()
 
 			// 蜜罐检测
 			isHoney, reason := checkSocks5Honeypot(node)
