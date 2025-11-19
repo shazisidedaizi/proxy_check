@@ -61,14 +61,14 @@ func checkProxy(proxyStr, apiToken string) (CheckResp, error) {
 		resp, e := client.Get(api)
 		if e != nil {
 			err = e
-			time.Sleep(baseDelay * (1 << (attempt - 1)))
+			time.Sleep(baseDelay * time.Duration(1<<(attempt-1)))
 			continue
 		}
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		err = json.Unmarshal(bodyBytes, &result)
 		if err != nil {
-			time.Sleep(baseDelay * (attempt - 1)))
+			time.Sleep(baseDelay * time.Duration(1<<(attempt-1)))
 			continue
 		}
 		if result.Success {
@@ -133,8 +133,8 @@ func checkSocks5Honeypot(rawNode string) (bool, string) {
 	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	n, _ := conn.Read(resp)
 	elapsed := time.Since(start).Milliseconds()
+
 	if elapsed <= 20 {
-		<= 20 {
 		return true, "响应过快(<20ms)，蜜罐特征"
 	}
 	if n >= 2 && resp[1] == 0x00 {
@@ -157,31 +157,31 @@ func main() {
 	botToken := os.Getenv("BOT_TOKEN")
 	chatId := os.Getenv("CHAT_ID")
 	apiToken := os.Getenv("API_TOKEN")
-	nodesFile := os.Getenv("NODES_URL") // 现在支持 http/https 网址或 https:// 开头的远程文件
+	nodesURL := os.Getenv("NODES_URL") // 支持本地文件路径或 http/https 网址
 
-	if botToken == "" || chatId == "" || apiToken == "" || nodesFile == "" {
+	if botToken == "" || chatId == "" || apiToken == "" || nodesURL == "" {
 		fmt.Println("缺少必要的环境变量：BOT_TOKEN CHAT_ID API_TOKEN NODES_URL")
 		os.Exit(1)
 	}
 
-	// ==================== 新增：支持从 URL 下载节点列表 ====================
+	// ==================== 支持 URL 或本地文件 ====================
 	var scanner *bufio.Scanner
-	if strings.HasPrefix(strings.ToLower(nodesFile), "http://") || strings.HasPrefix(strings.ToLower(nodesFile), "https://") {
-		// 远程 URL
-		resp, err := http.Get(nodesFile)
+	if strings.HasPrefix(strings.ToLower(nodesURL), "http://") || strings.HasPrefix(strings.ToLower(nodesURL), "https://") {
+		// 远程下载
+		resp, err := http.Get(nodesURL)
 		if err != nil {
 			fmt.Printf("下载节点列表失败: %v\n", err)
 			os.Exit(1)
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
-			fmt.Printf("下载节点列表失败，HTTP %d\n", resp.StatusCode)
+			fmt.Printf("下载节点列表失败，状态码: %d\n", resp.StatusCode)
 			os.Exit(1)
 		}
 		scanner = bufio.NewScanner(resp.Body)
 	} else {
-		// 原来本地文件的方式（兼容旧用法）
-		file, err := os.Open(nodesFile)
+		// 本地文件（兼容旧方式）
+		file, err := os.Open(nodesURL)
 		if err != nil {
 			fmt.Println("打开节点文件失败:", err)
 			os.Exit(1)
@@ -189,7 +189,6 @@ func main() {
 		defer file.Close()
 		scanner = bufio.NewScanner(file)
 	}
-	// ====================================================================
 
 	var nodes []string
 	seen := make(map[string]bool)
@@ -202,7 +201,7 @@ func main() {
 		nodes = append(nodes, raw)
 	}
 	if err := scanner.Err(); err != nil {
-		fmt.Println("读取节点列表出错:", err)
+		fmt.Printf("读取节点列表出错: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -225,16 +224,16 @@ func main() {
 		sem <- struct{}{}
 		go func(node string) {
 			defer wg.Done()
-			defer func() { <-sem }()
+			defer func() { <-.Concurrent }()
 
-			// ==================== 蜜罐检测 ====================
+			// 蜜罐检测
 			isHoney, reason := checkSocks5Honeypot(node)
 			if isHoney {
 				fmt.Printf("[蜜罐] %s -> %s\n", node, reason)
 				return
 			}
 
-			// ==================== API 检测 ====================
+			// API 检测
 			resp, err := checkProxy(node, apiToken)
 			if err != nil || !resp.Success {
 				fmt.Printf("节点无效或请求失败: %s\n", node)
@@ -261,7 +260,7 @@ func main() {
 	}
 	wg.Wait()
 
-	// 排序：先按国家，再按延迟
+	// 排序：国家 → 延迟
 	sort.Slice(results, func(i, j int) bool {
 		if results[i].Country == results[j].Country {
 			return results[i].Delay < results[j].Delay
