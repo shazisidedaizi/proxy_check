@@ -182,7 +182,8 @@ func checkHoneypot(proto, addr string) (bool, string) {
 		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 		n, err := conn.Read(resp)
 
-		// === 修复点：直接使用 time.Since，不单独定义变量，防止"declared and not used"错误 ===
+		// ====== 核心修复 ======
+		// 这里直接计算时间，不再赋值给 elapsed 变量，彻底解决 "declared and not used" 错误
 		if time.Since(start).Milliseconds() <= 20 {
 			return true, "响应过快(<20ms)，蜜罐特征"
 		}
