@@ -228,7 +228,6 @@ func checkHoneypot(proto, addr string) (bool, string) {
         conn.SetReadDeadline(time.Now().Add(3 * time.Second))
         buf := make([]byte, 1024)
         n, err := conn.Read(buf)
-        elapsed := time.Since(start).Milliseconds()
 
         if err != nil || n == 0 {
             return true, "无有效响应，疑似蜜罐"
