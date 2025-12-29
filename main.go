@@ -49,7 +49,7 @@ func sendTelegramMessage(botToken, chatId, text string) error {
 // ====================== 调用 API 检测 ======================
 func checkProxy(proxyStr, apiToken string) (CheckResp, error) {
 	api := fmt.Sprintf(
-		"https://check.xn--xg8h.netlib.re/check?proxy=%s&token=%s",
+		"https://check.szsddz.de5.net/check?proxy=%s&token=%s",
 		url.QueryEscape(proxyStr), apiToken,
 	)
 	client := &http.Client{Timeout: 25 * time.Second}
