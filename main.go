@@ -34,17 +34,37 @@ type CheckResp struct {
 }
 
 // ====================== TG 发送函数 ======================
-func sendTelegramMessage(botToken, chatId, text string) error {
+func sendTelegramMessage(botToken, chatId, text string) {
 	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", botToken)
-	data := url.Values{}
-	data.Set("chat_id", chatId)
-	data.Set("text", text)
-	resp, err := http.PostForm(apiURL, data)
-	if err != nil {
-		return err
+
+	sendOnce := func() error {
+		data := url.Values{}
+		data.Set("chat_id", chatId)
+		data.Set("text", text)
+
+		resp, err := http.PostForm(apiURL, data)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+		}
+		return nil
 	}
-	defer resp.Body.Close()
-	return nil
+
+	// 第一次发送
+	if err := sendOnce(); err != nil {
+		// 等待 1 秒再重试
+		time.Sleep(1 * time.Second)
+
+		// 第二次发送
+		if err2 := sendOnce(); err2 != nil {
+			fmt.Println("TG 发送失败:", err2)
+		}
+	}
 }
 
 // ====================== 调用 API 检测 ======================
@@ -204,8 +224,10 @@ func checkHoneypot(proto, addr string) (bool, string) {
 		if !strings.HasPrefix(respStr, "HTTP/") {
 			return true, "响应非 HTTP，疑似蜜罐"
 		}
-		if elapsed <= 20 {
-			return true, "响应过快(<20ms)，蜜罐特征"
+		if strings.Contains(respStr, " 200 ") ||
+		   strings.Contains(respStr, " 407 ") ||
+   		   strings.Contains(respStr, " 403 ") {
+    		return false, "正常 HTTP 代理响应"
 		}
 		return false, "正常 HTTP"
 
@@ -345,11 +367,13 @@ func main() {
         	// ③ API 检测（统一用标准格式）
         	proxyStr := proto + "://" + addr
         	resp, err := checkProxy(proxyStr, apiToken)
-        	if err != nil || !resp.Success {
-            	return
-        	}
+			if err != nil {
+    			return
+			}
+			if !resp.Success {
+    			return
+			}
 
-        	// ④ 后续逻辑保持不变
         	if resp.Company.Type != "isp" && resp.ASN.Type != "isp" {
             	return
         	}
