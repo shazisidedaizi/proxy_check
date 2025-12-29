@@ -323,43 +323,51 @@ func main() {
 	sem := make(chan struct{}, concurrency)
 
 	for _, node := range nodes {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(node string) {
-			defer wg.Done()
-			defer func() { <-sem }()
+    	wg.Add(1)
+    	sem <- struct{}{}
+    	go func(node string) {
+        	defer wg.Done()
+        	defer func() { <-sem }()
 
-			// 蜜罐检测
-			isHoney, reason := checkSocks5Honeypot(node)
-			if isHoney {
-				fmt.Printf("[蜜罐] %s -> %s\n", node, reason)
-				return
-			}
+        	// ① 预处理（必须第一步）
+        	proto, addr, ok := preprocessNode(node)
+	        if !ok {
+            	return
+        	}
 
-			// API 检测
-			resp, err := checkProxy(node, apiToken)
-			if err != nil || !resp.Success {
-				fmt.Printf("节点无效或请求失败: %s\n", node)
-				return
-			}
-			if resp.Company.Type != "isp" && resp.ASN.Type != "isp" {
-				return
-			}
-			if resp.Delay <= 0 || resp.Delay > 1000 {
-				return
-			}
+        	// ② 蜜罐检测（按协议分流）
+        	isHoney, reason := checkHoneypot(proto, addr)
+        	if isHoney {
+            	fmt.Printf("[蜜罐][%s] %s -> %s\n", proto, addr, reason)
+            	return
+        	}
 
-			line := fmt.Sprintf("%s#%s", resp.Proxy, resp.Location.CountryCode)
-			fmt.Printf("[有效] %s (延迟: %.0fms)\n", line, resp.Delay)
+        	// ③ API 检测（统一用标准格式）
+        	proxyStr := proto + "://" + addr
+        	resp, err := checkProxy(proxyStr, apiToken)
+        	if err != nil || !resp.Success {
+            	return
+        	}
 
-			mu.Lock()
-			results = append(results, NodeResult{
-				Line:    line,
-				Country: resp.Location.CountryCode,
-				Delay:   resp.Delay,
-			})
-			mu.Unlock()
-		}(node)
+        	// ④ 后续逻辑保持不变
+        	if resp.Company.Type != "isp" && resp.ASN.Type != "isp" {
+            	return
+        	}
+        	if resp.Delay <= 0 || resp.Delay > 1000 {
+            	return
+        	}
+
+        	line := fmt.Sprintf("%s#%s", resp.Proxy, resp.Location.CountryCode)
+        	fmt.Printf("[有效] %s (%.0fms)\n", line, resp.Delay)
+
+        	mu.Lock()
+        	results = append(results, NodeResult{
+            	Line:    line,
+            	Country: resp.Location.CountryCode,
+            	Delay:   resp.Delay,
+        	})
+        	mu.Unlock()
+    	}(node)
 	}
 	wg.Wait()
 
