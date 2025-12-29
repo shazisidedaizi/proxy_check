@@ -79,78 +79,139 @@ func checkProxy(proxyStr, apiToken string) (CheckResp, error) {
 	return result, err
 }
 
-// ====================== 蜜罐检测函数 ======================
-func normalizeSocks5Addr(node string) string {
-	node = strings.TrimSpace(node)
-	if strings.HasPrefix(node, "socks5://") {
-		node = strings.TrimPrefix(node, "socks5://")
+// -------------------- 通用预处理函数 --------------------
+var ipPortProtoRe = regexp.MustCompile(`(\d{1,3}(?:\.\d{1,3}){3})[:|](\d+)(?::|\|)?(http|socks5)?`)
+
+func preprocessNode(raw string) (proto string, addr string, ok bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", false
 	}
-	if strings.Contains(node, "@") {
-		parts := strings.Split(node, "@")
-		return parts[len(parts)-1]
+
+	// 去掉协议前缀
+	if strings.Contains(raw, "://") {
+		parts := strings.SplitN(raw, "://", 2)
+		proto = strings.ToLower(parts[0])
+		raw = parts[1]
 	}
-	return node
+
+	// 去掉认证信息 user:pass@
+	if strings.Contains(raw, "@") {
+		parts := strings.Split(raw, "@")
+		raw = parts[len(parts)-1]
+	}
+
+	// 尝试从描述文本提取 ip:port 和协议
+	m := ipPortProtoRe.FindStringSubmatch(raw)
+	if len(m) >= 3 {
+		ip := m[1]
+		port := m[2]
+		if proto == "" && len(m) == 4 && m[3] != "" {
+			proto = strings.ToLower(m[3])
+		}
+		if proto == "" {
+			proto = "socks5" // 默认 SOCKS5
+		}
+		return proto, ip + ":" + port, true
+	}
+
+	return "", "", false
 }
 
-func checkSocks5Honeypot(rawNode string) (bool, string) {
-	addr := normalizeSocks5Addr(rawNode)
-	if addr == "" {
-		return false, "非 SOCKS5"
-	}
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-	if err != nil {
-		return false, "无法连接节点"
-	}
-	defer conn.Close()
-
-	start := time.Now()
-	// VER=5, NMETHODS=1, NO_AUTH
-	_, err = conn.Write([]byte{0x05, 0x01, 0x00})
-	if err != nil {
-		return false, "握手发送失败"
-	}
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	method := make([]byte, 2)
-	_, err = conn.Read(method)
-	if err != nil {
-		return false, "未返回握手响应"
-	}
-	if method[0] != 0x05 {
-		return true, "VER 不是 0x05，像蜜罐"
-	}
-	if method[1] == 0x02 {
-		return false, "需要认证的正常 SOCKS5"
-	}
-	if method[1] != 0x00 {
-		return false, "不支持的认证类型（非蜜罐）"
-	}
-
-	req := []byte{0x05, 0x01, 0x00, 0x01, 240, 0, 0, 1, 0xFF, 0xFF}
-	_, err = conn.Write(req)
-	if err != nil {
-		return false, "发送假请求失败"
-	}
-	resp := make([]byte, 10)
-	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	n, _ := conn.Read(resp)
-	elapsed := time.Since(start).Milliseconds()
-
-	if elapsed <= 20 {
-		return true, "响应过快(<20ms)，蜜罐特征"
-	}
-	if n >= 2 && resp[1] == 0x00 {
-		return true, "固定返回 REP=00，蜜罐"
-	}
-	if n >= 10 {
-		port := binary.BigEndian.Uint16(resp[8:10])
-		if port == 0 {
-			return true, "返回 BND.PORT=0，不真实，蜜罐"
+// -------------------- 蜜罐检测函数 --------------------
+func checkHoneypot(proto, addr string) (bool, string) {
+	if proto == "socks5" {
+		// ---------------- SOCKS5 检测 ----------------
+		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		if err != nil {
+			return false, "无法连接节点"
 		}
+		defer conn.Close()
+
+		start := time.Now()
+		_, err = conn.Write([]byte{0x05, 0x01, 0x00})
+		if err != nil {
+			return false, "握手发送失败"
+		}
+
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		method := make([]byte, 2)
+		_, err = conn.Read(method)
+		if err != nil {
+			return false, "未返回握手响应"
+		}
+
+		if method[0] != 0x05 {
+			return true, "VER 不是 0x05，像蜜罐"
+		}
+		if method[1] == 0x02 {
+			return false, "需要认证的正常 SOCKS5"
+		}
+
+		req := []byte{0x05, 0x01, 0x00, 0x01, 240, 0, 0, 1, 0xFF, 0xFF}
+		_, err = conn.Write(req)
+		if err != nil {
+			return false, "发送假请求失败"
+		}
+		resp := make([]byte, 10)
+		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		n, _ := conn.Read(resp)
+		elapsed := time.Since(start).Milliseconds()
+
+		if elapsed <= 20 {
+			return true, "响应过快(<20ms)，蜜罐特征"
+		}
+		if n >= 2 && resp[1] == 0x00 {
+			return true, "固定返回 REP=00，蜜罐"
+		}
+		if n >= 10 {
+			port := binary.BigEndian.Uint16(resp[8:10])
+			if port == 0 {
+				return true, "返回 BND.PORT=0，不真实，蜜罐"
+			}
+		}
+		if n == 0 {
+			return true, "空响应，蜜罐概率高"
+		}
+		return false, "正常 SOCKS5"
+
+	} else if proto == "http" {
+		// ---------------- HTTP 检测 ----------------
+		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		if err != nil {
+			return false, "无法连接节点"
+		}
+		defer conn.Close()
+
+		start := time.Now()
+		req := "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n"
+		_, err = conn.Write([]byte(req))
+		if err != nil {
+			return false, "发送请求失败"
+		}
+
+		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		buf := make([]byte, 1024)
+		n, err := conn.Read(buf)
+		elapsed := time.Since(start).Milliseconds()
+		if err != nil {
+			return true, "无响应或连接断开，疑似蜜罐"
+		}
+		if n == 0 {
+			return true, "空响应，疑似蜜罐"
+		}
+		respStr := string(buf[:n])
+		if !strings.HasPrefix(respStr, "HTTP/") {
+			return true, "响应非 HTTP，疑似蜜罐"
+		}
+		if elapsed <= 20 {
+			return true, "响应过快(<20ms)，蜜罐特征"
+		}
+		return false, "正常 HTTP"
+
+	} else {
+		return false, "未知协议"
 	}
-	if n == 0 {
-		return true, "空响应，蜜罐概率高"
-	}
-	return false, "正常 SOCKS5"
 }
 
 // -------------------- 节点提取函数 --------------------
