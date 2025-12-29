@@ -140,100 +140,136 @@ func preprocessNode(raw string) (proto string, addr string, ok bool) {
 
 // -------------------- 蜜罐检测函数 --------------------
 func checkHoneypot(proto, addr string) (bool, string) {
-	if proto == "socks5" {
-		// ---------------- SOCKS5 检测 ----------------
-		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-		if err != nil {
-			return false, "无法连接节点"
-		}
-		defer conn.Close()
+    if proto == "socks5" {
+        // ---------------- SOCKS5 检测 ----------------
+        conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+        if err != nil {
+            return false, "无法连接节点"
+        }
+        defer conn.Close()
 
-		start := time.Now()
-		_, err = conn.Write([]byte{0x05, 0x01, 0x00})
-		if err != nil {
-			return false, "握手发送失败"
-		}
+        start := time.Now()
 
-		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-		method := make([]byte, 2)
-		_, err = conn.Read(method)
-		if err != nil {
-			return false, "未返回握手响应"
-		}
+        // 发送 SOCKS5 握手：版本5 + 无认证
+        _, err = conn.Write([]byte{0x05, 0x01, 0x00})
+        if err != nil {
+            return false, "握手发送失败"
+        }
 
-		if method[0] != 0x05 {
-			return true, "VER 不是 0x05，像蜜罐"
-		}
-		if method[1] == 0x02 {
-			return false, "需要认证的正常 SOCKS5"
-		}
+        conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+        method := make([]byte, 2)
+        _, err = conn.Read(method)
+        if err != nil {
+            return false, "未返回握手响应"
+        }
 
-		req := []byte{0x05, 0x01, 0x00, 0x01, 240, 0, 0, 1, 0xFF, 0xFF}
-		_, err = conn.Write(req)
-		if err != nil {
-			return false, "发送假请求失败"
-		}
-		resp := make([]byte, 10)
-		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-		n, _ := conn.Read(resp)
-		elapsed := time.Since(start).Milliseconds()
+        if method[0] != 0x05 {
+            return true, "VER 不是 0x05，像蜜罐"
+        }
 
-		if elapsed <= 20 {
-			return true, "响应过快(<20ms)，蜜罐特征"
-		}
-		if n >= 2 && resp[1] == 0x00 {
-			return true, "固定返回 REP=00，蜜罐"
-		}
-		if n >= 10 {
-			port := binary.BigEndian.Uint16(resp[8:10])
-			if port == 0 {
-				return true, "返回 BND.PORT=0，不真实，蜜罐"
-			}
-		}
-		if n == 0 {
-			return true, "空响应，蜜罐概率高"
-		}
-		return false, "正常 SOCKS5"
+        if method[1] == 0x02 {
+            return false, "需要认证的正常 SOCKS5"
+        }
 
-	} else if proto == "http" {
-		// ---------------- HTTP 检测 ----------------
-		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-		if err != nil {
-			return false, "无法连接节点"
-		}
-		defer conn.Close()
+        // 发送假的 CONNECT 请求到 240.0.0.1:65535（几乎不可能真实存在）
+        req := []byte{0x05, 0x01, 0x00, 0x01, 240, 0, 0, 1, 0xFF, 0xFF}
+        _, err = conn.Write(req)
+        if err != nil {
+            return false, "发送假请求失败"
+        }
 
-		start := time.Now()
-		req := "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n"
-		_, err = conn.Write([]byte(req))
-		if err != nil {
-			return false, "发送请求失败"
-		}
+        resp := make([]byte, 10)
+        conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+        n, err := conn.Read(resp)
+        elapsed := time.Since(start).Milliseconds()
 
-		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-		buf := make([]byte, 1024)
-		n, err := conn.Read(buf)
-		elapsed := time.Since(start).Milliseconds()
-		if err != nil {
-			return true, "无响应或连接断开，疑似蜜罐"
-		}
-		if n == 0 {
-			return true, "空响应，疑似蜜罐"
-		}
-		respStr := string(buf[:n])
-		if !strings.HasPrefix(respStr, "HTTP/") {
-			return true, "响应非 HTTP，疑似蜜罐"
-		}
-		if strings.Contains(respStr, " 200 ") ||
-		   strings.Contains(respStr, " 407 ") ||
-   		   strings.Contains(respStr, " 403 ") {
-    		return false, "正常 HTTP 代理响应"
-		}
-		return false, "正常 HTTP"
+        if elapsed <= 20 {
+            return true, "响应过快(<20ms)，蜜罐特征"
+        }
 
-	} else {
-		return false, "未知协议"
-	}
+        if err != nil || n == 0 {
+            return true, "无响应或空响应，蜜罐概率高"
+        }
+
+        if n < 4 {
+            return true, "响应长度太短，疑似蜜罐"
+        }
+
+        if resp[1] == 0x00 {
+            // 很多蜜罐固定返回成功（REP=00）
+            if n >= 10 {
+                port := binary.BigEndian.Uint16(resp[8:10])
+                if port == 0 {
+                    return true, "返回 BND.PORT=0，不真实，蜜罐"
+                }
+            }
+            return true, "固定返回 REP=00，蜜罐特征"
+        }
+
+        return false, "正常 SOCKS5 行为"
+
+    } else if proto == "http" {
+        // ---------------- HTTP 检测 ----------------
+        conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+        if err != nil {
+            return false, "无法连接节点"
+        }
+        defer conn.Close()
+
+        start := time.Now()
+
+        // 标准的 CONNECT 请求（目标使用 example.com:443）
+        req := "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
+        _, err = conn.Write([]byte(req))
+        if err != nil {
+            return false, "发送请求失败"
+        }
+
+        conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+        buf := make([]byte, 1024)
+        n, err := conn.Read(buf)
+        elapsed := time.Since(start).Milliseconds()
+
+        if err != nil || n == 0 {
+            return true, "无有效响应，疑似蜜罐"
+        }
+
+        respStr := string(buf[:n])
+
+        // 严格解析第一行（状态行）
+        lines := strings.SplitN(respStr, "\r\n", 2)
+        if len(lines) == 0 || !strings.HasPrefix(lines[0], "HTTP/1.1 ") {
+            return true, "非标准 HTTP 响应起始行"
+        }
+
+        statusLine := lines[0]
+        fields := strings.Fields(statusLine)
+        if len(fields) < 3 { // HTTP/1.1 200 OK 至少要有 3 个字段
+            return true, "状态行格式错误或不完整"
+        }
+
+        statusCode := fields[1]
+
+        // 成功情况：必须是 200 且包含 "Connection established"（忽略大小写）
+        if statusCode == "200" {
+            lowerStatus := strings.ToLower(statusLine)
+            if strings.Contains(lowerStatus, "connection established") ||
+                strings.Contains(lowerStatus, "connected") {
+                return false, "正常 HTTP CONNECT 200"
+            }
+            return true, "200 但缺少 Connection established 关键字，疑似伪装蜜罐"
+        }
+
+        // 常见代理响应（仍视为存活节点，但不通过蜜罐检测）
+        if statusCode == "407" || statusCode == "403" || statusCode == "503" {
+            return false, fmt.Sprintf("代理返回 %s（存活但需认证/拒绝）", statusCode)
+        }
+
+        // 其他状态码一律视为异常/蜜罐
+        return true, fmt.Sprintf("非预期响应状态码: %s", statusCode)
+    }
+
+    return false, "未知协议"
 }
 
 // -------------------- 节点提取函数 --------------------
