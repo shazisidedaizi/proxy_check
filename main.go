@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"regexp"
 )
 
 // ====================== API 结果结构 ======================
@@ -152,6 +153,33 @@ func checkSocks5Honeypot(rawNode string) (bool, string) {
 	return false, "正常 SOCKS5"
 }
 
+// -------------------- 节点提取函数 --------------------
+var lineRe = regexp.MustCompile(`(\d{1,3}(?:\.\d{1,3}){3})[:|](\d+)[:|](http|socks5)`)
+
+func extractNodeWithProtocol(raw string) (string, bool) {
+    raw = strings.TrimSpace(raw)
+    if raw == "" {
+        return "", false
+    }
+
+    // 已经是标准格式
+    if strings.HasPrefix(raw, "http://") ||
+        strings.HasPrefix(raw, "https://") ||
+        strings.HasPrefix(raw, "socks5://") {
+        return raw, true
+    }
+
+    m := lineRe.FindStringSubmatch(raw)
+    if len(m) == 4 {
+        ip := m[1]
+        port := m[2]
+        proto := m[3]
+        return proto + "://" + ip + ":" + port, true
+    }
+
+    return "", false
+}
+
 // ========================= 主程序 =========================
 func main() {
 	botToken := os.Getenv("BOT_TOKEN")
@@ -167,45 +195,59 @@ func main() {
 	// ==================== 支持 URL 或本地文件 ====================
 	var scanner *bufio.Scanner
 	if strings.HasPrefix(strings.ToLower(nodesURL), "http://") || strings.HasPrefix(strings.ToLower(nodesURL), "https://") {
-		// 远程下载
-		resp, err := http.Get(nodesURL)
-		if err != nil {
-			fmt.Printf("下载节点列表失败: %v\n", err)
-			os.Exit(1)
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			fmt.Printf("下载节点列表失败，状态码: %d\n", resp.StatusCode)
-			os.Exit(1)
-		}
-		scanner = bufio.NewScanner(resp.Body)
+    	// 远程下载
+    	resp, err := http.Get(nodesURL)
+    	if err != nil {
+        	fmt.Printf("下载节点列表失败: %v\n", err)
+        	os.Exit(1)
+    	}
+    	defer resp.Body.Close()
+    	if resp.StatusCode != http.StatusOK {
+        	fmt.Printf("下载节点列表失败，状态码: %d\n", resp.StatusCode)
+        	os.Exit(1)
+    	}
+    	scanner = bufio.NewScanner(resp.Body)
 	} else {
-		// 本地文件（兼容旧方式）
-		file, err := os.Open(nodesURL)
-		if err != nil {
-			fmt.Println("打开节点文件失败:", err)
-			os.Exit(1)
-		}
-		defer file.Close()
-		scanner = bufio.NewScanner(file)
+    	// 本地文件（兼容旧方式）
+    	file, err := os.Open(nodesURL)
+    	if err != nil {
+        	fmt.Println("打开节点文件失败:", err)
+        	os.Exit(1)
+    	}
+    	defer file.Close()
+    	scanner = bufio.NewScanner(file)
 	}
 
+	// 存放节点
 	var nodes []string
 	seen := make(map[string]bool)
+
 	for scanner.Scan() {
-		raw := strings.TrimSpace(scanner.Text())
-		if raw == "" || seen[raw] {
-			continue
-		}
-		seen[raw] = true
-		nodes = append(nodes, raw)
+    	raw := strings.TrimSpace(scanner.Text())
+    	if raw == "" {
+        	continue
+    	}
+
+    	// 调用提取函数，将描述型文本转换成标准节点
+    	node, ok := extractNodeWithProtocol(raw)
+    	if !ok {
+        	continue
+    	}
+
+    	if seen[node] {
+        	continue
+    	}
+    	seen[node] = true
+    	nodes = append(nodes, node)
 	}
+
 	if err := scanner.Err(); err != nil {
-		fmt.Printf("读取节点列表出错: %v\n", err)
-		os.Exit(1)
+    	fmt.Printf("读取节点列表出错: %v\n", err)
+    	os.Exit(1)
 	}
 
 	fmt.Printf("加载完成：共 %d 个唯一节点\n", len(nodes))
+
 
 	type NodeResult struct {
 		Line    string
