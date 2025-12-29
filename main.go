@@ -109,9 +109,9 @@ func preprocessNode(raw string) (proto string, addr string, ok bool) {
 		if proto == "" && len(m) == 4 && m[3] != "" {
 			proto = strings.ToLower(m[3])
 		}
-		if proto == "" {
-			proto = "socks5" // 默认 SOCKS5
-		}
+		if proto != "http" && proto != "socks5" {
+    		return "", "", false
+		}		
 		return proto, ip + ":" + port, true
 	}
 
