@@ -10,17 +10,17 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
-	"regexp"
 )
 
 // ====================== API 结果结构 ======================
 type CheckResp struct {
-	Success bool `json:"success"`
-	Proxy   string `json:"proxy"`
+	Success bool    `json:"success"`
+	Proxy   string  `json:"proxy"`
 	Delay   float64 `json:"elapsed_ms"`
 	Company struct {
 		Type string `json:"type"`
@@ -130,8 +130,8 @@ func preprocessNode(raw string) (proto string, addr string, ok bool) {
 			proto = strings.ToLower(m[3])
 		}
 		if proto != "http" && proto != "socks5" {
-    		return "", "", false
-		}		
+			return "", "", false
+		}
 		return proto, ip + ":" + port, true
 	}
 
@@ -140,162 +140,160 @@ func preprocessNode(raw string) (proto string, addr string, ok bool) {
 
 // -------------------- 蜜罐检测函数 --------------------
 func checkHoneypot(proto, addr string) (bool, string) {
-    if proto == "socks5" {
-        // ---------------- SOCKS5 检测 ----------------
-        conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-        if err != nil {
-            return false, "无法连接节点"
-        }
-        defer conn.Close()
+	if proto == "socks5" {
+		// ---------------- SOCKS5 检测 ----------------
+		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		if err != nil {
+			return false, "无法连接节点"
+		}
+		defer conn.Close()
 
-        start := time.Now()
+		start := time.Now()
 
-        // 发送 SOCKS5 握手：版本5 + 无认证
-        _, err = conn.Write([]byte{0x05, 0x01, 0x00})
-        if err != nil {
-            return false, "握手发送失败"
-        }
+		// 发送 SOCKS5 握手：版本5 + 无认证
+		_, err = conn.Write([]byte{0x05, 0x01, 0x00})
+		if err != nil {
+			return false, "握手发送失败"
+		}
 
-        conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-        method := make([]byte, 2)
-        _, err = conn.Read(method)
-        if err != nil {
-            return false, "未返回握手响应"
-        }
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		method := make([]byte, 2)
+		_, err = conn.Read(method)
+		if err != nil {
+			return false, "未返回握手响应"
+		}
 
-        if method[0] != 0x05 {
-            return true, "VER 不是 0x05，像蜜罐"
-        }
+		if method[0] != 0x05 {
+			return true, "VER 不是 0x05，像蜜罐"
+		}
 
-        if method[1] == 0x02 {
-            return false, "需要认证的正常 SOCKS5"
-        }
+		if method[1] == 0x02 {
+			return false, "需要认证的正常 SOCKS5"
+		}
 
-        // 发送假的 CONNECT 请求到 240.0.0.1:65535（几乎不可能真实存在）
-        req := []byte{0x05, 0x01, 0x00, 0x01, 240, 0, 0, 1, 0xFF, 0xFF}
-        _, err = conn.Write(req)
-        if err != nil {
-            return false, "发送假请求失败"
-        }
+		// 发送假的 CONNECT 请求到 240.0.0.1:65535（几乎不可能真实存在）
+		req := []byte{0x05, 0x01, 0x00, 0x01, 240, 0, 0, 1, 0xFF, 0xFF}
+		_, err = conn.Write(req)
+		if err != nil {
+			return false, "发送假请求失败"
+		}
 
-        resp := make([]byte, 10)
-        conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-        n, err := conn.Read(resp)
-        elapsed := time.Since(start).Milliseconds()
+		resp := make([]byte, 10)
+		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		n, err := conn.Read(resp)
 
-        if elapsed <= 20 {
-            return true, "响应过快(<20ms)，蜜罐特征"
-        }
+		// === 修复点：直接使用 time.Since，不单独定义变量，防止"declared and not used"错误 ===
+		if time.Since(start).Milliseconds() <= 20 {
+			return true, "响应过快(<20ms)，蜜罐特征"
+		}
 
-        if err != nil || n == 0 {
-            return true, "无响应或空响应，蜜罐概率高"
-        }
+		if err != nil || n == 0 {
+			return true, "无响应或空响应，蜜罐概率高"
+		}
 
-        if n < 4 {
-            return true, "响应长度太短，疑似蜜罐"
-        }
+		if n < 4 {
+			return true, "响应长度太短，疑似蜜罐"
+		}
 
-        if resp[1] == 0x00 {
-            // 很多蜜罐固定返回成功（REP=00）
-            if n >= 10 {
-                port := binary.BigEndian.Uint16(resp[8:10])
-                if port == 0 {
-                    return true, "返回 BND.PORT=0，不真实，蜜罐"
-                }
-            }
-            return true, "固定返回 REP=00，蜜罐特征"
-        }
+		if resp[1] == 0x00 {
+			// 很多蜜罐固定返回成功（REP=00）
+			if n >= 10 {
+				port := binary.BigEndian.Uint16(resp[8:10])
+				if port == 0 {
+					return true, "返回 BND.PORT=0，不真实，蜜罐"
+				}
+			}
+			return true, "固定返回 REP=00，蜜罐特征"
+		}
 
-        return false, "正常 SOCKS5 行为"
+		return false, "正常 SOCKS5 行为"
 
-    } else if proto == "http" {
-        // ---------------- HTTP 检测 ----------------
-        conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-        if err != nil {
-            return false, "无法连接节点"
-        }
-        defer conn.Close()
+	} else if proto == "http" {
+		// ---------------- HTTP 检测 ----------------
+		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		if err != nil {
+			return false, "无法连接节点"
+		}
+		defer conn.Close()
 
-        start := time.Now()
+		// 标准的 CONNECT 请求（目标使用 example.com:443）
+		req := "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
+		_, err = conn.Write([]byte(req))
+		if err != nil {
+			return false, "发送请求失败"
+		}
 
-        // 标准的 CONNECT 请求（目标使用 example.com:443）
-        req := "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
-        _, err = conn.Write([]byte(req))
-        if err != nil {
-            return false, "发送请求失败"
-        }
+		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		buf := make([]byte, 1024)
+		n, err := conn.Read(buf)
 
-        conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-        buf := make([]byte, 1024)
-        n, err := conn.Read(buf)
+		if err != nil || n == 0 {
+			return true, "无有效响应，疑似蜜罐"
+		}
 
-        if err != nil || n == 0 {
-            return true, "无有效响应，疑似蜜罐"
-        }
+		respStr := string(buf[:n])
 
-        respStr := string(buf[:n])
+		// 严格解析第一行（状态行）
+		lines := strings.SplitN(respStr, "\r\n", 2)
+		if len(lines) == 0 || !strings.HasPrefix(lines[0], "HTTP/1.1 ") {
+			return true, "非标准 HTTP 响应起始行"
+		}
 
-        // 严格解析第一行（状态行）
-        lines := strings.SplitN(respStr, "\r\n", 2)
-        if len(lines) == 0 || !strings.HasPrefix(lines[0], "HTTP/1.1 ") {
-            return true, "非标准 HTTP 响应起始行"
-        }
+		statusLine := lines[0]
+		fields := strings.Fields(statusLine)
+		if len(fields) < 3 { // HTTP/1.1 200 OK 至少要有 3 个字段
+			return true, "状态行格式错误或不完整"
+		}
 
-        statusLine := lines[0]
-        fields := strings.Fields(statusLine)
-        if len(fields) < 3 { // HTTP/1.1 200 OK 至少要有 3 个字段
-            return true, "状态行格式错误或不完整"
-        }
+		statusCode := fields[1]
 
-        statusCode := fields[1]
+		// 成功情况：必须是 200 且包含 "Connection established"（忽略大小写）
+		if statusCode == "200" {
+			lowerStatus := strings.ToLower(statusLine)
+			if strings.Contains(lowerStatus, "connection established") ||
+				strings.Contains(lowerStatus, "connected") {
+				return false, "正常 HTTP CONNECT 200"
+			}
+			return true, "200 但缺少 Connection established 关键字，疑似伪装蜜罐"
+		}
 
-        // 成功情况：必须是 200 且包含 "Connection established"（忽略大小写）
-        if statusCode == "200" {
-            lowerStatus := strings.ToLower(statusLine)
-            if strings.Contains(lowerStatus, "connection established") ||
-                strings.Contains(lowerStatus, "connected") {
-                return false, "正常 HTTP CONNECT 200"
-            }
-            return true, "200 但缺少 Connection established 关键字，疑似伪装蜜罐"
-        }
+		// 常见代理响应（仍视为存活节点，但不通过蜜罐检测）
+		if statusCode == "407" || statusCode == "403" || statusCode == "503" {
+			return false, fmt.Sprintf("代理返回 %s（存活但需认证/拒绝）", statusCode)
+		}
 
-        // 常见代理响应（仍视为存活节点，但不通过蜜罐检测）
-        if statusCode == "407" || statusCode == "403" || statusCode == "503" {
-            return false, fmt.Sprintf("代理返回 %s（存活但需认证/拒绝）", statusCode)
-        }
+		// 其他状态码一律视为异常/蜜罐
+		return true, fmt.Sprintf("非预期响应状态码: %s", statusCode)
+	}
 
-        // 其他状态码一律视为异常/蜜罐
-        return true, fmt.Sprintf("非预期响应状态码: %s", statusCode)
-    }
-
-    return false, "未知协议"
+	return false, "未知协议"
 }
 
 // -------------------- 节点提取函数 --------------------
 var lineRe = regexp.MustCompile(`(\d{1,3}(?:\.\d{1,3}){3})[:|](\d+)[:|](http|socks5)`)
 
 func extractNodeWithProtocol(raw string) (string, bool) {
-    raw = strings.TrimSpace(raw)
-    if raw == "" {
-        return "", false
-    }
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", false
+	}
 
-    // 已经是标准格式
-    if strings.HasPrefix(raw, "http://") ||
-        strings.HasPrefix(raw, "https://") ||
-        strings.HasPrefix(raw, "socks5://") {
-        return raw, true
-    }
+	// 已经是标准格式
+	if strings.HasPrefix(raw, "http://") ||
+		strings.HasPrefix(raw, "https://") ||
+		strings.HasPrefix(raw, "socks5://") {
+		return raw, true
+	}
 
-    m := lineRe.FindStringSubmatch(raw)
-    if len(m) == 4 {
-        ip := m[1]
-        port := m[2]
-        proto := m[3]
-        return proto + "://" + ip + ":" + port, true
-    }
+	m := lineRe.FindStringSubmatch(raw)
+	if len(m) == 4 {
+		ip := m[1]
+		port := m[2]
+		proto := m[3]
+		return proto + "://" + ip + ":" + port, true
+	}
 
-    return "", false
+	return "", false
 }
 
 // ========================= 主程序 =========================
@@ -313,27 +311,27 @@ func main() {
 	// ==================== 支持 URL 或本地文件 ====================
 	var scanner *bufio.Scanner
 	if strings.HasPrefix(strings.ToLower(nodesURL), "http://") || strings.HasPrefix(strings.ToLower(nodesURL), "https://") {
-    	// 远程下载
-    	resp, err := http.Get(nodesURL)
-    	if err != nil {
-        	fmt.Printf("下载节点列表失败: %v\n", err)
-        	os.Exit(1)
-    	}
-    	defer resp.Body.Close()
-    	if resp.StatusCode != http.StatusOK {
-        	fmt.Printf("下载节点列表失败，状态码: %d\n", resp.StatusCode)
-        	os.Exit(1)
-    	}
-    	scanner = bufio.NewScanner(resp.Body)
+		// 远程下载
+		resp, err := http.Get(nodesURL)
+		if err != nil {
+			fmt.Printf("下载节点列表失败: %v\n", err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			fmt.Printf("下载节点列表失败，状态码: %d\n", resp.StatusCode)
+			os.Exit(1)
+		}
+		scanner = bufio.NewScanner(resp.Body)
 	} else {
-    	// 本地文件（兼容旧方式）
-    	file, err := os.Open(nodesURL)
-    	if err != nil {
-        	fmt.Println("打开节点文件失败:", err)
-        	os.Exit(1)
-    	}
-    	defer file.Close()
-    	scanner = bufio.NewScanner(file)
+		// 本地文件（兼容旧方式）
+		file, err := os.Open(nodesURL)
+		if err != nil {
+			fmt.Println("打开节点文件失败:", err)
+			os.Exit(1)
+		}
+		defer file.Close()
+		scanner = bufio.NewScanner(file)
 	}
 
 	// 存放节点
@@ -341,31 +339,30 @@ func main() {
 	seen := make(map[string]bool)
 
 	for scanner.Scan() {
-    	raw := strings.TrimSpace(scanner.Text())
-    	if raw == "" {
-        	continue
-    	}
+		raw := strings.TrimSpace(scanner.Text())
+		if raw == "" {
+			continue
+		}
 
-    	// 调用提取函数，将描述型文本转换成标准节点
-    	node, ok := extractNodeWithProtocol(raw)
-    	if !ok {
-        	continue
-    	}
+		// 调用提取函数，将描述型文本转换成标准节点
+		node, ok := extractNodeWithProtocol(raw)
+		if !ok {
+			continue
+		}
 
-    	if seen[node] {
-        	continue
-    	}
-    	seen[node] = true
-    	nodes = append(nodes, node)
+		if seen[node] {
+			continue
+		}
+		seen[node] = true
+		nodes = append(nodes, node)
 	}
 
 	if err := scanner.Err(); err != nil {
-    	fmt.Printf("读取节点列表出错: %v\n", err)
-    	os.Exit(1)
+		fmt.Printf("读取节点列表出错: %v\n", err)
+		os.Exit(1)
 	}
 
 	fmt.Printf("加载完成：共 %d 个唯一节点\n", len(nodes))
-
 
 	type NodeResult struct {
 		Line    string
@@ -380,53 +377,53 @@ func main() {
 	sem := make(chan struct{}, concurrency)
 
 	for _, node := range nodes {
-    	wg.Add(1)
-    	sem <- struct{}{}
-    	go func(node string) {
-        	defer wg.Done()
-        	defer func() { <-sem }()
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(node string) {
+			defer wg.Done()
+			defer func() { <-sem }()
 
-        	// ① 预处理（必须第一步）
-        	proto, addr, ok := preprocessNode(node)
-	        if !ok {
-            	return
-        	}
+			// ① 预处理（必须第一步）
+			proto, addr, ok := preprocessNode(node)
+			if !ok {
+				return
+			}
 
-        	// ② 蜜罐检测（按协议分流）
-        	isHoney, reason := checkHoneypot(proto, addr)
-        	if isHoney {
-            	fmt.Printf("[蜜罐][%s] %s -> %s\n", proto, addr, reason)
-            	return
-        	}
+			// ② 蜜罐检测（按协议分流）
+			isHoney, reason := checkHoneypot(proto, addr)
+			if isHoney {
+				fmt.Printf("[蜜罐][%s] %s -> %s\n", proto, addr, reason)
+				return
+			}
 
-        	// ③ API 检测（统一用标准格式）
-        	proxyStr := proto + "://" + addr
-        	resp, err := checkProxy(proxyStr, apiToken)
+			// ③ API 检测（统一用标准格式）
+			proxyStr := proto + "://" + addr
+			resp, err := checkProxy(proxyStr, apiToken)
 			if err != nil {
-    			return
+				return
 			}
 			if !resp.Success {
-    			return
+				return
 			}
 
-        	if resp.Company.Type != "isp" && resp.ASN.Type != "isp" {
-            	return
-        	}
-        	if resp.Delay <= 0 || resp.Delay > 1000 {
-            	return
-        	}
+			if resp.Company.Type != "isp" && resp.ASN.Type != "isp" {
+				return
+			}
+			if resp.Delay <= 0 || resp.Delay > 1000 {
+				return
+			}
 
-        	line := fmt.Sprintf("%s#%s", resp.Proxy, resp.Location.CountryCode)
-        	fmt.Printf("[有效] %s (%.0fms)\n", line, resp.Delay)
+			line := fmt.Sprintf("%s#%s", resp.Proxy, resp.Location.CountryCode)
+			fmt.Printf("[有效] %s (%.0fms)\n", line, resp.Delay)
 
-        	mu.Lock()
-        	results = append(results, NodeResult{
-            	Line:    line,
-            	Country: resp.Location.CountryCode,
-            	Delay:   resp.Delay,
-        	})
-        	mu.Unlock()
-    	}(node)
+			mu.Lock()
+			results = append(results, NodeResult{
+				Line:    line,
+				Country: resp.Location.CountryCode,
+				Delay:   resp.Delay,
+			})
+			mu.Unlock()
+		}(node)
 	}
 	wg.Wait()
 
